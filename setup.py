@@ -56,13 +56,13 @@ def get_torch_arch_list() -> Set[str]:
 
     # List are separated by ; or space.
     arch_list = arch_list.replace(" ", ";").split(";")
-    for arch in arch_list:
-        if arch not in valid_arch_strs:
-            raise ValueError(
-                f"Unsupported CUDA arch ({arch}). "
-                f"Valid CUDA arch strings are: {valid_arch_strs}.")
+    arch_list = [arch for arch in arch_list if arch in valid_arch_strs]
+    if not len(arch_list):
+        raise ValueError(
+            f"Unsupported CUDA arch ({arch}) is included in the "
+            f"`TORCH_CUDA_ARCH_LIST` env variable ({env_arch_list}). "
+            f"Valid CUDA arch strings are: {valid_arch_strs}.")
     return set(arch_list)
-
 
 # First, check the TORCH_CUDA_ARCH_LIST environment variable.
 compute_capabilities = get_torch_arch_list()
