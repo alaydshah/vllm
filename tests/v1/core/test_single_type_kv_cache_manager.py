@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.external_prefix import ExternalPrefixCoverage
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -30,6 +31,61 @@ from vllm.v1.kv_cache_interface import (
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("prefix", [0, 16, 64, 256])
+@pytest.mark.parametrize("suffix", [1, 15, 16, 17, 33])
+def test_external_prefix_coordinates_allocate_only_native_suffix(prefix, suffix):
+    """External coverage must not consume native blocks or shift model positions.
+
+    This tests the allocation boundary directly; it does not establish a
+    scheduler cache hit or authorize a worker to read an external prefix.
+    """
+    coverage = ExternalPrefixCoverage(prefix, 16)
+    pool = BlockPool(64, enable_caching=False, hash_block_size=16)
+    manager = FullAttentionManager(
+        FullAttentionSpec(16, num_kv_heads=1, head_size=1, dtype=torch.float32),
+        block_pool=pool,
+        enable_caching=False,
+        kv_cache_group_id=0,
+        scheduler_block_size=16,
+    )
+    free_before = pool.get_num_free_blocks()
+    absolute_end = prefix + suffix
+    native_end = coverage.native_num_tokens(absolute_end)
+    blocks = manager.allocate_new_blocks("returning", native_end, native_end)
+    assert len(blocks) == (suffix + 15) // 16
+    assert pool.get_num_free_blocks() == free_before - len(blocks)
+    block_ids = [block.block_id for block in blocks]
+    for position in range(prefix, absolute_end):
+        page, row = divmod(position - prefix, 16)
+        assert coverage.native_slot(position, block_ids) == block_ids[page] * 16 + row
+
+    # Crossing the next boundary must allocate just the missing suffix page.
+    next_end = prefix + len(blocks) * 16 + 1
+    new_native_end = coverage.native_num_tokens(next_end)
+    assert (
+        len(manager.allocate_new_blocks("returning", new_native_end, new_native_end))
+        == 1
+    )
+    manager.free("returning")
+    assert pool.get_num_free_blocks() == free_before
+
+
+@pytest.mark.parametrize("tokens,block_size", [(-16, 16), (17, 16), (0, 0)])
+def test_external_prefix_rejects_invalid_coverage(tokens, block_size):
+    with pytest.raises(ValueError):
+        ExternalPrefixCoverage(tokens, block_size)
+
+
+def test_external_prefix_does_not_map_external_or_unallocated_positions():
+    coverage = ExternalPrefixCoverage(64, 16)
+    with pytest.raises(ValueError, match="precedes"):
+        coverage.native_slot(63, [7])
+    with pytest.raises(IndexError, match="not allocated"):
+        coverage.native_slot(80, [7])
+    with pytest.raises(ValueError, match="non-negative"):
+        coverage.native_slot(64, [-1])
 
 
 def test_external_computed_blocks_do_not_corrupt_free_pool():
