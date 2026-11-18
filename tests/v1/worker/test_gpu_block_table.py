@@ -8,9 +8,87 @@ from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda(),
-    reason="requires CUDA",
+    not current_platform.is_cuda_alike(),
+    reason="requires CUDA or ROCm",
 )
+
+
+@pytest.mark.parametrize("kernel_block_size", [8, 16])
+def test_external_prefix_slots_preserve_positions_and_request_order(kernel_block_size):
+    """Native suffix writes must follow request-state offsets, not batch order."""
+    device = torch.device("cuda")
+    tables = BlockTables(
+        block_sizes=[16, 16],
+        max_num_reqs=3,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[2, 2],
+        device=device,
+        kernel_block_sizes=[kernel_block_size, kernel_block_size],
+    )
+    tables.append_block_ids(0, ([7, 2], [3, 4]), overwrite=True)
+    tables.append_block_ids(2, ([5, 9], [6, 8]), overwrite=True)
+    tables.apply_staged_writes()
+    order = torch.tensor([2, 0], dtype=torch.int32, device=device)
+    starts = torch.tensor([0, 3, 8], dtype=torch.int32, device=device)
+    positions = torch.tensor(
+        [0, 15, 16, 63, 64, 79, 80, 96], dtype=torch.int64, device=device
+    )
+    original_positions = positions.clone()
+    prefixes = torch.tensor([[64, 0, 0], [64, 0, 0]], device=device)
+    actual = tables.compute_slot_mappings(
+        order, starts, positions, 12, external_prefix_lengths=prefixes
+    )
+    assert actual.tolist() == [
+        [80, 95, 144, -1, 112, 127, 32, -1, -1, -1, -1, -1],
+        [96, 111, 128, -1, 48, 63, 64, -1, -1, -1, -1, -1],
+    ]
+    assert torch.equal(positions, original_positions)
+
+
+def test_zero_external_prefix_matches_default_slot_mapping():
+    device = torch.device("cuda")
+    tables = BlockTables([16], 1, 8, [2], device, [16])
+    tables.append_block_ids(0, ([7, 2],), overwrite=True)
+    tables.apply_staged_writes()
+    order = torch.tensor([0], dtype=torch.int32, device=device)
+    starts = torch.tensor([0, 3], dtype=torch.int32, device=device)
+    positions = torch.tensor([0, 15, 16], dtype=torch.int64, device=device)
+    expected = tables.compute_slot_mappings(order, starts, positions, 8).clone()
+    actual = tables.compute_slot_mappings(
+        order,
+        starts,
+        positions,
+        8,
+        external_prefix_lengths=torch.zeros((1, 1), dtype=torch.int64, device=device),
+    )
+    assert torch.equal(actual, expected)
+
+
+def test_external_prefix_slot_mapping_rejects_unsupported_layout():
+    device = torch.device("cuda")
+    tables = BlockTables([16], 1, 8, [2], device, [16])
+    order = torch.tensor([0], dtype=torch.int32, device=device)
+    starts = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    positions = torch.tensor([64], dtype=torch.int64, device=device)
+    with pytest.raises(ValueError, match="layout"):
+        tables.compute_slot_mappings(
+            order,
+            starts,
+            positions,
+            1,
+            external_prefix_lengths=torch.tensor(
+                [[64]], dtype=torch.int32, device=device
+            ),
+        )
+    tables.cp_size = 2
+    with pytest.raises(ValueError, match="does not support CP"):
+        tables.compute_slot_mappings(
+            order,
+            starts,
+            positions,
+            1,
+            external_prefix_lengths=torch.tensor([[64]], device=device),
+        )
 
 
 def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):

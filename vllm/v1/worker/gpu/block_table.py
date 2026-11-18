@@ -195,7 +195,30 @@ class BlockTables:
         positions: torch.Tensor,
         num_tokens_padded: int,
         out: torch.Tensor | None = None,
+        *,
+        external_prefix_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Map absolute model positions to native cache slots.
+
+        ``external_prefix_lengths`` optionally describes suffix-only block
+        tables, indexed by [cache group, request state index], not batch order.
+        It must be a contiguous device int64 tensor with shape
+        [num_kv_cache_groups, max_num_reqs]. Callers must validate nonnegative,
+        group-block-aligned coverage before staging it. Positions in external
+        storage or beyond native capacity produce PAD_SLOT_ID. This does not
+        change model positions or provide an external attention reader.
+        """
+        if external_prefix_lengths is not None:
+            if self.cp_size != 1:
+                raise ValueError("external prefix slot mapping does not support CP")
+            if (
+                external_prefix_lengths.shape
+                != (self.num_kv_cache_groups, self.max_num_reqs)
+                or external_prefix_lengths.dtype != torch.int64
+                or external_prefix_lengths.device != self.slot_mappings.device
+                or not external_prefix_lengths.is_contiguous()
+            ):
+                raise ValueError("invalid external prefix lengths layout")
         if self.num_kv_cache_groups == 0:
             return (self.slot_mappings if out is None else out)[:, :num_tokens_padded]
         num_reqs = idx_mapping.shape[0]
@@ -214,6 +237,10 @@ class BlockTables:
             slot_mappings,
             slot_mappings.stride(0),
             self.cp_rank,
+            external_prefix_lengths,
+            self.num_blocks.gpu,
+            self.num_blocks.gpu.stride(0),
+            HAS_EXTERNAL_PREFIX=external_prefix_lengths is not None,
             CP_SIZE=self.cp_size,
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
@@ -287,6 +314,10 @@ def _compute_slot_mappings_kernel(
     slot_mappings_ptr,  # [num_kv_cache_groups, max_num_tokens]
     slot_mappings_stride,
     cp_rank,
+    external_prefix_lengths,
+    num_blocks_ptr,
+    num_blocks_stride,
+    HAS_EXTERNAL_PREFIX: tl.constexpr,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     PAD_ID: tl.constexpr,
@@ -315,11 +346,20 @@ def _compute_slot_mappings_kernel(
     mapping_enabled = tl.load(slot_mapping_enabled + group_id)
 
     req_state_idx = tl.load(idx_mapping + batch_idx)
+    if HAS_EXTERNAL_PREFIX:
+        prefix_length = tl.load(
+            external_prefix_lengths + group_id * num_blocks_stride + req_state_idx
+        )
+        native_num_blocks = tl.load(
+            num_blocks_ptr + group_id * num_blocks_stride + req_state_idx
+        )
     start_idx = tl.load(query_start_loc + batch_idx)
     end_idx = tl.load(query_start_loc + batch_idx + 1)
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
+        if HAS_EXTERNAL_PREFIX:
+            positions = positions - prefix_length
 
         if CP_SIZE == 1:
             # Common case: Context parallelism is not used.
@@ -340,13 +380,20 @@ def _compute_slot_mappings_kernel(
             mapping_enabled, local_positions // kernel_block_size, 0
         )
         block_offsets = local_positions % kernel_block_size
+        if HAS_EXTERNAL_PREFIX:
+            is_local = (
+                (offset < end_idx)
+                & mapping_enabled
+                & (positions >= 0)
+                & (block_indices < native_num_blocks)
+            )
         block_numbers = tl.load(
             block_table_ptr + req_state_idx * block_table_stride + block_indices,
             mask=is_local,
             other=0,
         )
         slot_ids = block_numbers * kernel_block_size + block_offsets
-        if CP_SIZE != 1:
+        if CP_SIZE != 1 or HAS_EXTERNAL_PREFIX:
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
         slot_ids = tl.where(mapping_enabled, slot_ids, PAD_ID)
