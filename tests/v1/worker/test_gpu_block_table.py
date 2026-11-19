@@ -6,7 +6,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.external_prefix import ExternalPrefixState
+from vllm.v1.worker.gpu.states import RequestState
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda_alike(),
@@ -14,75 +14,43 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_external_prefix_state_slot_reuse_updates_real_mapping():
+def test_native_request_state_owns_prefix_offset_and_slot_reuse():
     device = torch.device("cuda")
-    state = ExternalPrefixState([16], 2, device)
-    tables = BlockTables([16], 2, 8, [2], device, [16])
-    tables.append_block_ids(1, ([7, 2],), overwrite=True)
+    state = RequestState(1, 128, 8, 0, 256, device)
+    assert state.external_prefix_lengths is None
+    tables = BlockTables([16], 1, 8, [2], device, [16])
+    tables.append_block_ids(0, ([7, 2],), overwrite=True)
     tables.apply_staged_writes()
-    order = torch.tensor([1], dtype=torch.int32, device=device)
+    order = torch.tensor([0], dtype=torch.int32, device=device)
     starts = torch.tensor([0, 1], dtype=torch.int32, device=device)
-    position = torch.tensor([75], dtype=torch.int64, device=device)
-    pointer = state.lengths.data_ptr()
-    state.add_request("A", 1, 64)
-    state.apply_staged_writes()
-    assert (
-        tables.compute_slot_mappings(
-            order, starts, position, 1, external_prefix_lengths=state.lengths
-        ).item()
-        == 7 * 16 + 11
-    )
-    # A finishes; B acquires the same slot before the next staging operation.
-    state.remove_request("A")
-    state.add_request("B", 1, 96)
-    state.remove_request("A")  # Late duplicate removal cannot erase B.
-    state.apply_staged_writes()
-    position.fill_(107)
-    assert (
-        tables.compute_slot_mappings(
-            order, starts, position, 1, external_prefix_lengths=state.lengths
-        ).item()
-        == 7 * 16 + 11
-    )
-    assert state.lengths.data_ptr() == pointer
-    state.remove_request("B")
-    state.add_request("dense", 1, 0)
-    state.apply_staged_writes()
-    assert state.lengths.tolist() == [[0, 0]]
-    position.fill_(11)
-    assert (
-        tables.compute_slot_mappings(
-            order, starts, position, 1, external_prefix_lengths=state.lengths
-        ).item()
-        == 7 * 16 + 11
-    )
+    pointer = None
+    for req_id, prefix, position in [("A", 64, 75), ("B", 96, 107), ("dense", 0, 11)]:
+        state.add_request(
+            req_id, 128, list(range(128)), prefix, 1, external_prefix_length=prefix
+        )
+        state.apply_staged_writes()
+        assert state.external_prefix_lengths is not None
+        lengths = state.external_prefix_lengths.gpu
+        if pointer is not None:
+            assert lengths.data_ptr() == pointer
+        pointer = lengths.data_ptr()
+        positions = torch.tensor([position], dtype=torch.int64, device=device)
+        assert (
+            tables.compute_slot_mappings(
+                order, starts, positions, 1, external_prefix_lengths=lengths
+            ).item()
+            == 7 * 16 + 11
+        )
+        assert state.remove_request(req_id) == 0
+        assert state.remove_request(req_id) is None
 
 
-def test_external_prefix_state_validates_before_mutation():
-    state = ExternalPrefixState([16, 32], 2, torch.device("cuda"))
-    with pytest.raises(ValueError, match="complete blocks"):
-        state.add_request("A", 1, 16)
-    state.add_request("A", 1, 64)
-    with pytest.raises(ValueError, match="already registered"):
-        state.add_request("A", 0, 96)
-    with pytest.raises(ValueError, match="already registered"):
-        state.add_request("B", 1, 96)
-    with pytest.raises(ValueError, match="capacity"):
-        state.add_request("B", 2, 64)
-    state.apply_staged_writes()
-    assert state.lengths.tolist() == [[0, 64], [0, 64]]
-
-
-def test_external_prefix_state_unchanged_decode_does_not_stage(monkeypatch):
-    state = ExternalPrefixState([16], 1, torch.device("cuda"))
-    state.add_request("A", 0, 64)
-    state.apply_staged_writes()
-
-    def unexpected_write():
-        pytest.fail("unchanged decode should not enqueue metadata writes")
-
-    monkeypatch.setattr(state._lengths, "apply_write", unexpected_write)
-    state.apply_staged_writes()
+def test_native_request_state_rejects_invalid_coverage_before_admission():
+    state = RequestState(1, 128, 8, 0, 256, torch.device("cuda"))
+    with pytest.raises(ValueError, match="computed coverage"):
+        state.add_request("A", 81, list(range(81)), 0, 1, external_prefix_length=64)
+    assert state.num_reqs == 0
+    assert state.external_prefix_lengths is None
 
 
 @pytest.mark.parametrize("kernel_block_size", [8, 16])

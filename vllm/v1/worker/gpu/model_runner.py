@@ -1118,6 +1118,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.postprocess_sampled(**outputs)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        metadata = scheduler_output.kv_connector_metadata
+        prefixes = (
+            metadata.get_external_prefix_lengths() if metadata is not None else {}
+        )
+        if prefixes:
+            new_requests = {
+                req.req_id: req for req in scheduler_output.scheduled_new_reqs
+            }
+            groups = [g for group in self.attn_groups for g in group]
+            if (
+                self.block_tables.cp_size != 1
+                or not groups
+                or not all(g.backend.supports_external_prefix for g in groups)
+            ):
+                raise ValueError(
+                    "external prefix requires a compatible attention backend without CP"
+                )
+            for req_id, prefix in prefixes.items():
+                req = new_requests.get(req_id)
+                if (
+                    req is None
+                    or type(prefix) is not int
+                    or prefix <= 0
+                    or prefix > req.num_computed_tokens
+                    or prefix >= req.prompt_len
+                    or any(prefix % size for size in self.block_tables.block_sizes)
+                ):
+                    raise ValueError("invalid external prefix admission metadata")
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
@@ -1135,6 +1163,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                external_prefix_length=prefixes.get(req_id, 0),
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
@@ -1487,6 +1516,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
             input_batch.positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
+            external_prefix_lengths=(
+                self.req_states.external_prefix_lengths.gpu
+                if self.req_states.external_prefix_lengths is not None
+                else None
+            ),
         )
         return block_tables, slot_mappings
 

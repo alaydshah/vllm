@@ -158,7 +158,14 @@ class KVConnectorMetadata(ABC):  # noqa: B024
     Scheduler KVConnector -> Worker KVConnector.
     """
 
-    pass
+    def get_external_prefix_lengths(self) -> dict[str, int]:
+        """Immutable coverage for newly admitted requests, consumed before inputs.
+
+        No I/O or mutation: return CPU metadata already available in this step.
+        Bank handles and leases remain connector-owned. Requires a compatible
+        direct external-prefix attention backend; ordinary connectors return {}.
+        """
+        return {}
 
 
 class KVConnectorWorkerMetadata(ABC):

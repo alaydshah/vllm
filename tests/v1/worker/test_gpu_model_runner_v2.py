@@ -298,3 +298,79 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
     runner.capture_model(profile_only=True)
 
     assert lock_calls == []
+
+
+def test_external_prefix_metadata_precedes_native_slot_preparation():
+    from unittest.mock import Mock
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.worker.gpu.states import RequestState
+
+    class Metadata(KVConnectorMetadata):
+        def get_external_prefix_lengths(self):
+            return {"A": 64}
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    device = torch.device("cuda")
+    runner.req_states = RequestState(1, 128, 8, 0, 256, device)
+    runner.block_tables = BlockTables([16], 1, 8, [2], device, [16])
+    runner.attn_groups = [
+        [SimpleNamespace(backend=SimpleNamespace(supports_external_prefix=True))]
+    ]
+    runner.model_state = Mock()
+    runner.lora_state = Mock()
+    runner.adaptive_verification = runner.pooling_runner = runner.pp_handler = None
+    runner.encoder_cache = runner.prompt_logprobs_worker = runner.sampler = None
+    runner.is_last_pp_rank = False
+    runner.pcp_manager = None
+    new_req = NewRequestData(
+        "A",
+        list(range(81)),
+        [],
+        None,
+        None,
+        ([7, 2],),
+        64,
+        None,
+        prefill_token_ids=list(range(81)),
+    )
+    output = SimpleNamespace(
+        scheduled_new_reqs=[new_req], kv_connector_metadata=Metadata()
+    )
+    # An ordinary reader must reject this before changing request state.
+    runner.attn_groups[0][0].backend.supports_external_prefix = False
+    with pytest.raises(ValueError, match="compatible attention backend"):
+        runner.add_requests(output)
+    assert runner.req_states.num_reqs == 0
+    runner.attn_groups[0][0].backend.supports_external_prefix = True
+    valid_metadata = output.kv_connector_metadata
+    for invalid in ({"A": 65}, {"missing": 64}, {"A": -16}):
+        output.kv_connector_metadata = SimpleNamespace(
+            get_external_prefix_lengths=lambda invalid=invalid: invalid
+        )
+        with pytest.raises(ValueError, match="admission metadata"):
+            runner.add_requests(output)
+        assert runner.req_states.num_reqs == 0
+    output.kv_connector_metadata = valid_metadata
+    runner.add_requests(output)
+    runner.block_tables.apply_staged_writes()
+    batch = SimpleNamespace(
+        idx_mapping=torch.tensor([0], dtype=torch.int32, device=device),
+        num_reqs_after_padding=1,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        positions=torch.tensor([75], dtype=torch.int64, device=device),
+        num_tokens_after_padding=1,
+    )
+    _, slots = runner.prepare_attn(batch)
+    assert slots.item() == 7 * 16 + 11
+    # Removal goes through the real runner/native request lifecycle.
+    assert runner._remove_request("A")
+    new_req.req_id = "dense"
+    new_req.num_computed_tokens = 0
+    output.kv_connector_metadata = None
+    runner.add_requests(output)
+    runner.block_tables.apply_staged_writes()
+    batch.positions.fill_(11)
+    _, slots = runner.prepare_attn(batch)
+    assert slots.item() == 7 * 16 + 11

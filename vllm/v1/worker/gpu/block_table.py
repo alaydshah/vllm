@@ -203,7 +203,8 @@ class BlockTables:
         ``external_prefix_lengths`` optionally describes suffix-only block
         tables, indexed by [cache group, request state index], not batch order.
         It must be a contiguous device int64 tensor with shape
-        [num_kv_cache_groups, max_num_reqs]. Callers must validate nonnegative,
+        [num_kv_cache_groups, max_num_reqs], or [max_num_reqs] when groups
+        share coverage. Callers must validate nonnegative,
         group-block-aligned coverage before staging it. Positions in external
         storage or beyond native capacity produce PAD_SLOT_ID. This does not
         change model positions or provide an external attention reader.
@@ -213,7 +214,10 @@ class BlockTables:
                 raise ValueError("external prefix slot mapping does not support CP")
             if (
                 external_prefix_lengths.shape
-                != (self.num_kv_cache_groups, self.max_num_reqs)
+                not in (
+                    (self.max_num_reqs,),
+                    (self.num_kv_cache_groups, self.max_num_reqs),
+                )
                 or external_prefix_lengths.dtype != torch.int64
                 or external_prefix_lengths.device != self.slot_mappings.device
                 or not external_prefix_lengths.is_contiguous()
@@ -238,6 +242,12 @@ class BlockTables:
             slot_mappings.stride(0),
             self.cp_rank,
             external_prefix_lengths,
+            (
+                external_prefix_lengths.stride(0)
+                if external_prefix_lengths is not None
+                and external_prefix_lengths.ndim == 2
+                else 0
+            ),
             self.num_blocks.gpu,
             self.num_blocks.gpu.stride(0),
             HAS_EXTERNAL_PREFIX=external_prefix_lengths is not None,
@@ -315,6 +325,7 @@ def _compute_slot_mappings_kernel(
     slot_mappings_stride,
     cp_rank,
     external_prefix_lengths,
+    external_prefix_stride,
     num_blocks_ptr,
     num_blocks_stride,
     HAS_EXTERNAL_PREFIX: tl.constexpr,
@@ -348,7 +359,7 @@ def _compute_slot_mappings_kernel(
     req_state_idx = tl.load(idx_mapping + batch_idx)
     if HAS_EXTERNAL_PREFIX:
         prefix_length = tl.load(
-            external_prefix_lengths + group_id * num_blocks_stride + req_state_idx
+            external_prefix_lengths + group_id * external_prefix_stride + req_state_idx
         )
         native_num_blocks = tl.load(
             num_blocks_ptr + group_id * num_blocks_stride + req_state_idx

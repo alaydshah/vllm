@@ -24,6 +24,9 @@ class RequestState:
         self.vocab_size = vocab_size
         self.device = device
 
+        # Optional immutable storage offset, owned by the native request slot.
+        # Allocate only when an external-prefix request is admitted.
+        self.external_prefix_lengths: StagedWriteTensor | None = None
         self.req_id_to_index: dict[str, int] = {}
         self.index_to_req_id: dict[int, str] = {}
         self.free_indices = list(range(max_num_reqs))
@@ -95,12 +98,25 @@ class RequestState:
         all_token_ids: list[int],
         num_computed_tokens: int,
         max_tokens: int,
+        external_prefix_length: int = 0,
     ) -> None:
+        if not 0 <= external_prefix_length <= num_computed_tokens:
+            raise ValueError("external prefix exceeds computed coverage")
         assert len(self.free_indices) > 0, "No free indices"
+        if external_prefix_length and self.external_prefix_lengths is None:
+            self.external_prefix_lengths = StagedWriteTensor(
+                self.max_num_reqs, dtype=torch.int64, device=self.device
+            )
         req_idx = self.free_indices.pop()
         self.req_id_to_index[req_id] = req_idx
         self.index_to_req_id[req_idx] = req_id
 
+        if self.external_prefix_lengths is not None:
+            # Overwrite on every admission, including dense slot reuse. Removed
+            # slots are not readers; no competing remove/add writes are needed.
+            self.external_prefix_lengths.stage_write_elem(
+                req_idx, external_prefix_length
+            )
         self.max_seq_len[req_idx] = prompt_len + max_tokens
         self.prompt_len.np[req_idx] = prompt_len
         prefill_len = len(all_token_ids)
@@ -117,6 +133,8 @@ class RequestState:
         self.draft_tokens[req_idx].zero_()
 
     def apply_staged_writes(self) -> None:
+        if self.external_prefix_lengths is not None:
+            self.external_prefix_lengths.apply_write()
         self.prompt_len.copy_to_uva()
         self.prefill_len.copy_to_uva()
         self.total_len.apply_write()

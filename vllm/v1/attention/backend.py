@@ -69,6 +69,9 @@ class AttentionBackend(ABC):
     # Does attention's forward() include kv cache update?
     forward_includes_kv_cache_update: bool = True
 
+    # Reader accepts suffix-only native block tables plus connector-owned history.
+    supports_external_prefix: bool = False
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(1)]
