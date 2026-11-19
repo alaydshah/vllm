@@ -143,6 +143,15 @@ def test_external_prefix_registration_is_atomic_across_groups():
     assert manager.allocate_slots(request, 17, num_external_computed_tokens=64) is None
     assert manager.block_pool.get_num_free_blocks() == free
     assert all(not g.req_to_blocks for g in manager.coordinator.single_type_managers)
+    register_external_prefix_coverage(manager, request, 64)
+    # A smaller prefill chunk now fits without replacing the coverage lease.
+    assert (
+        manager.allocate_slots(request, 1, num_external_computed_tokens=64) is not None
+    )
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == free
+    # Cancellation of a registered but never admitted request also cleans up.
+    register_external_prefix_coverage(manager, request, 64)
     manager.free(request)
     assert all(
         not g.external_prefixes for g in manager.coordinator.single_type_managers
@@ -1149,3 +1158,19 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+def test_waiting_external_coverage_preserves_dense_common_prefix(
+    external_prefix_manager,
+):
+    manager = external_prefix_manager
+    manager.allocate_new_blocks("dense", 32, 32)
+    assert manager.get_num_common_prefix_blocks("dense") == 2
+    manager.register_external_prefix("waiting", ExternalPrefixCoverage(64, 16))
+    manager.register_external_prefix("waiting", ExternalPrefixCoverage(64, 16))
+    assert manager.get_num_common_prefix_blocks("dense") == 2
+    manager.add_local_computed_blocks("waiting", [], 0, 64)
+    manager.allocate_new_blocks("waiting", 65, 65)
+    assert manager.get_num_common_prefix_blocks("dense") == 0
+    manager.free("waiting")
+    assert manager.get_num_common_prefix_blocks("dense") == 2

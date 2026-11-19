@@ -56,6 +56,8 @@ def register_external_prefix_coverage(
 
     This does not acquire a storage lease or establish readiness. The connector
     must keep its immutable entry alive and report this same external hit count.
+    Before admission, retries may repeat coverage while retaining the same lease.
+    Changed coverage is rejected; cancellation uses manager.free().
     """
     if (
         request.num_computed_tokens != 0
@@ -111,11 +113,10 @@ class ExternalPrefixFullAttentionManager(FullAttentionManager):
             raise ValueError("external prefix does not support context parallelism")
         if coverage.block_size != self.block_size or coverage.num_tokens == 0:
             raise ValueError("external prefix requires positive group-aligned coverage")
-        if (
-            request_id in self.external_prefixes
-            or request_id in self.req_to_blocks
-            or request_id in self.num_cached_block
-        ):
+        if request_id in self.req_to_blocks or request_id in self.num_cached_block:
+            raise ValueError("external prefix must be registered before admission")
+        previous = self.external_prefixes.get(request_id)
+        if previous is not None and previous != coverage:
             raise ValueError("external prefix must be registered before admission")
 
     def _validate_external_hit(
@@ -236,7 +237,7 @@ class ExternalPrefixFullAttentionManager(FullAttentionManager):
         )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
-        if self.external_prefixes:
+        if self.external_prefixes.keys() & self.req_to_blocks.keys():
             return 0
         return super().get_num_common_prefix_blocks(running_request_id)
 
