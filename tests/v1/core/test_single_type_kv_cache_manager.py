@@ -8,6 +8,7 @@ import torch
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.external_prefix import ExternalPrefixCoverage
+from vllm.v1.core.external_prefix_manager import ExternalPrefixFullAttentionManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -31,6 +32,126 @@ from vllm.v1.kv_cache_interface import (
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.fixture
+def external_prefix_manager():
+    pool = BlockPool(10, enable_caching=True, hash_block_size=16)
+    return ExternalPrefixFullAttentionManager(
+        FullAttentionSpec(16, num_kv_heads=1, head_size=1, dtype=torch.float32),
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=16,
+    )
+
+
+@pytest.mark.parametrize("prefix", [16, 64, 256])
+@pytest.mark.parametrize("suffix", [1, 16, 17])
+def test_external_manager_admission_growth_and_release(
+    external_prefix_manager, prefix, suffix
+):
+    """Exercise coordinator-style calls using absolute counts throughout."""
+    manager = external_prefix_manager
+    pool = manager.block_pool
+    free = pool.get_num_free_blocks()
+    manager.register_external_prefix("A", ExternalPrefixCoverage(prefix, 16))
+    end = prefix + suffix
+    needed = manager.get_num_blocks_to_allocate("A", end, [], prefix, 0, end)
+    assert needed == (suffix + 15) // 16
+    manager.add_local_computed_blocks("A", [], 0, prefix)
+    manager.allocate_external_computed_blocks("A", 0, prefix)
+    assert pool.get_num_free_blocks() == free
+    blocks = manager.allocate_new_blocks("A", end, end)
+    assert len(blocks) == needed
+    assert all(not block.is_null for block in blocks)
+    assert pool.get_num_free_blocks() == free - needed
+    next_end = prefix + needed * 16 + 1
+    assert manager.get_num_blocks_to_allocate("A", next_end, [], end, 0, next_end) == 1
+    assert len(manager.allocate_new_blocks("A", next_end, next_end)) == 1
+
+    # A connector hold must survive request retirement.
+    pool.touch(blocks[:1])
+    manager.free("A")
+    assert blocks[0].ref_cnt == 1
+    assert pool.get_num_free_blocks() == free - 1
+    pool.free_blocks(blocks[:1])
+    assert pool.get_num_free_blocks() == free
+    # Reusing the request ID after free must not inherit external coordinates.
+    assert len(manager.allocate_new_blocks("A", 32, 32)) == 2
+    manager.free("A")
+
+
+def test_external_manager_never_caches_approximate_suffix(external_prefix_manager):
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.request import Request
+
+    manager = external_prefix_manager
+    manager.register_external_prefix("A", ExternalPrefixCoverage(64, 16))
+    manager.add_local_computed_blocks("A", [], 0, 64)
+    blocks = manager.allocate_new_blocks("A", 96, 96)
+    request = Request("A", list(range(96)), SamplingParams(), None)
+    manager.cache_blocks(request, 96, replay_boundaries=[])
+    assert all(block.block_hash is None for block in blocks)
+    assert manager.get_num_common_prefix_blocks("A") == 0
+    manager.free("A")
+
+
+def test_external_manager_failure_and_deferred_free(external_prefix_manager):
+    manager = external_prefix_manager
+    pool = manager.block_pool
+    free = pool.get_num_free_blocks()
+    manager.register_external_prefix("A", ExternalPrefixCoverage(64, 16))
+    manager.add_local_computed_blocks("A", [], 0, 64)
+    assert manager.get_num_blocks_to_allocate("A", 224, [], 64, 0, 224) > free
+    with pytest.raises(ValueError, match="free blocks"):
+        manager.allocate_new_blocks("A", 224, 224)
+    assert pool.get_num_free_blocks() == free
+    assert manager.req_to_blocks["A"] == []
+    manager.allocate_new_blocks("A", 81, 81)
+    blocks = manager.pop_blocks_for_free("A")
+    assert pool.get_num_free_blocks() == free - 2
+    assert all(block.ref_cnt == 1 for block in blocks)
+    pool.free_blocks(reversed(blocks))
+    assert pool.get_num_free_blocks() == free
+    # Cancellation before allocation also removes registered coverage.
+    manager.register_external_prefix("A", ExternalPrefixCoverage(64, 16))
+    manager.free("A")
+    manager.register_external_prefix("A", ExternalPrefixCoverage(16, 16))
+    manager.free("A")
+
+
+def test_external_manager_rejects_mixed_hits_and_coverage_changes(
+    external_prefix_manager,
+):
+    manager = external_prefix_manager
+    manager.register_external_prefix("A", ExternalPrefixCoverage(64, 16))
+    with pytest.raises(ValueError, match="before admission"):
+        manager.register_external_prefix("A", ExternalPrefixCoverage(80, 16))
+    with pytest.raises(ValueError, match="local cache hit"):
+        manager.get_num_blocks_to_allocate("A", 81, [], 64, 16, 81)
+    with pytest.raises(ValueError, match="another cache hit"):
+        manager.allocate_external_computed_blocks("A", 0, 80)
+    with pytest.raises(ValueError, match="speculative"):
+        manager.allocate_new_blocks("A", 82, 81)
+    manager.dcp_world_size = 2
+    with pytest.raises(ValueError, match="context parallelism"):
+        manager.register_external_prefix("B", ExternalPrefixCoverage(64, 16))
+
+
+def test_external_manager_preserves_dense_hit_path(external_prefix_manager):
+    manager = external_prefix_manager
+    pool = manager.block_pool
+    free = pool.get_num_free_blocks()
+    # Ordinary connector hits still receive dense destination blocks.
+    assert manager.get_num_blocks_to_allocate("dense", 81, [], 64, 0, 81) == 6
+    manager.add_local_computed_blocks("dense", [], 0, 64)
+    manager.allocate_external_computed_blocks("dense", 0, 64)
+    assert len(manager.req_to_blocks["dense"]) == 4
+    assert len(manager.allocate_new_blocks("dense", 81, 81)) == 2
+    assert pool.get_num_free_blocks() == free - 6
+    manager.free("dense")
+    assert pool.get_num_free_blocks() == free
 
 
 @pytest.mark.parametrize("prefix", [0, 16, 64, 256])
