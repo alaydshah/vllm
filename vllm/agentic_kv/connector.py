@@ -12,7 +12,7 @@ closed so selecting this connector cannot silently enable incomplete serving.
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from vllm.agentic_kv.history import HistoryLease
+from vllm.agentic_kv.history import HistoryDescriptor, HistoryLease
 from vllm.agentic_kv.store import HistoryStore
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -37,10 +37,13 @@ if TYPE_CHECKING:
 
 @dataclass
 class AgenticKVMetadata(KVConnectorMetadata):
-    prefixes: dict[str, int]
+    histories: dict[str, HistoryDescriptor]
 
     def get_external_prefix_lengths(self) -> dict[str, int]:
-        return self.prefixes.copy()
+        return {
+            req_id: history.key.prefix_tokens
+            for req_id, history in self.histories.items()
+        }
 
 
 @dataclass
@@ -167,15 +170,17 @@ class AgenticKVConnector(KVConnectorBase_V1, SupportsHMA):
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
     ) -> AgenticKVMetadata:
-        prefixes = {}
+        histories = {}
         for req in scheduler_output.scheduled_new_reqs:
             state = self._admissions.get(req.req_id)
             if state is not None and state.use_external:
                 if not state.allocated:
                     raise ValueError("external history scheduled before allocation")
-                prefixes[req.req_id] = state.lease.history.prefix_tokens
+                histories[req.req_id] = HistoryDescriptor.from_history(
+                    state.lease.history
+                )
                 state.submitted = True
-        return AgenticKVMetadata(prefixes)
+        return AgenticKVMetadata(histories)
 
     def request_finished(
         self, request: "Request", block_ids: list[int]

@@ -303,13 +303,21 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
 def test_external_prefix_metadata_precedes_native_slot_preparation():
     from unittest.mock import Mock
 
-    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+    from vllm.agentic_kv.connector import AgenticKVMetadata
+    from vllm.agentic_kv.history import HistoryDescriptor, HistoryKey
     from vllm.v1.core.sched.output import NewRequestData
     from vllm.v1.worker.gpu.states import RequestState
 
-    class Metadata(KVConnectorMetadata):
-        def get_external_prefix_lengths(self):
-            return {"A": 64}
+    metadata = AgenticKVMetadata(
+        {
+            "A": HistoryDescriptor(
+                "generation1",
+                "bank7",
+                16,
+                HistoryKey("engine1", 16, 64, b"native-prefix-hash"),
+            )
+        }
+    )
 
     runner = GPUModelRunner.__new__(GPUModelRunner)
     device = torch.device("cuda")
@@ -336,7 +344,7 @@ def test_external_prefix_metadata_precedes_native_slot_preparation():
         prefill_token_ids=list(range(81)),
     )
     output = SimpleNamespace(
-        scheduled_new_reqs=[new_req], kv_connector_metadata=Metadata()
+        scheduled_new_reqs=[new_req], kv_connector_metadata=metadata
     )
     # An ordinary reader must reject this before changing request state.
     runner.attn_groups[0][0].backend.supports_external_prefix = False

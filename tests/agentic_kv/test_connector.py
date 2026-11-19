@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm.agentic_kv.connector import AgenticKVConnector
+from vllm.agentic_kv.connector import AgenticKVConnector, AgenticKVMetadata
 from vllm.agentic_kv.history import HistoryKey, SavedHistory
 from vllm.config import KVTransferConfig, ParallelConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
@@ -27,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 
 @pytest.fixture
@@ -130,7 +132,7 @@ def test_failed_native_admission_retries_same_lease_and_defers_release(setup):
     assert manager.allocate_slots(blocker, 16) is not None
     assert connector.get_num_new_matched_tokens(req, 0) == (64, False)
     assert manager.allocate_slots(req, 17, num_external_computed_tokens=64) is None
-    assert connector.build_connector_meta(SchedulerOutput.make_empty()).prefixes == {}
+    assert connector.build_connector_meta(SchedulerOutput.make_empty()).histories == {}
     publish(connector, req, "newer")
     assert connector.get_num_new_matched_tokens(req, 0) == (64, False)
     assert connector.history_store.evict("saved") is None
@@ -186,7 +188,7 @@ def test_dense_hit_appearing_during_retry_withdraws_only_pending_coverage(setup)
         is not None
     )
     assert len(manager.get_blocks("A").blocks[0]) == 6
-    assert metadata(connector, manager, req).prefixes == {}
+    assert metadata(connector, manager, req).histories == {}
     manager.free(req)
     manager.free(donor)
 
@@ -203,12 +205,49 @@ def test_preemption_recomputes_natively_but_keeps_inflight_history_alive(setup):
     req.num_preemptions += 1
     assert connector.get_num_new_matched_tokens(req, 0) == (0, False)
     assert manager.allocate_slots(req, 81) is not None
-    assert metadata(connector, manager, req).prefixes == {}
+    assert metadata(connector, manager, req).histories == {}
     assert connector.history_store.evict("saved") is None
     assert connector.request_finished(req, []) == (True, None)
     connector.update_connector_output(KVConnectorOutput(finished_sending={"A"}))
     manager.free(req)
     assert connector.history_store.evict("saved") is history
+
+
+def test_metadata_transports_immutable_identity_without_payload(setup):
+    class LocalPayload:
+        pass
+
+    connector, manager, _, _ = setup()
+    req = request()
+    history = SavedHistory(
+        "original",
+        64,
+        16,
+        "bank7",
+        100,
+        LocalPayload(),
+        HistoryKey("test-engine", 16, 64, req.block_hashes[3]),
+    )
+    connector.history_store.reserve("original", 100)
+    connector.history_store.publish("original", history)
+    connector.get_num_new_matched_tokens(req, 0)
+    newer = replace(history, entry_id="replacement", bank_version="bank8")
+    connector.history_store.reserve("replacement", 100)
+    connector.history_store.publish("replacement", newer)
+    blocks = manager.allocate_slots(req, 17, num_external_computed_tokens=64)
+    connector.update_state_after_alloc(req, blocks, 64)
+    encoded = MsgpackEncoder().encode(metadata(connector, manager, req))
+    assert len(encoded) == 1  # No out-of-band tensor buffers.
+    transported = MsgpackDecoder(AgenticKVMetadata).decode(encoded)
+    descriptor = transported.histories["A"]
+    assert descriptor.entry_id == "original" and descriptor.bank_version == "bank7"
+    assert descriptor.key == history.key
+    assert not hasattr(descriptor, "payload")
+    with pytest.raises(FrozenInstanceError):
+        descriptor.entry_id = "replacement"
+    offsets = transported.get_external_prefix_lengths()
+    offsets["A"] = 0
+    assert transported.get_external_prefix_lengths() == {"A": 64}
 
 
 def test_native_scheduler_admits_suffix_and_owns_delayed_free(setup):

@@ -65,6 +65,28 @@ class SavedHistory:
 
 
 @dataclass(frozen=True)
+class HistoryDescriptor:
+    """CPU-only identity sent to the worker; payload resolution stays local.
+
+    A descriptor does not transfer storage or establish worker readiness. The
+    reader must resolve this exact generation and bank in its resident catalog.
+    """
+
+    entry_id: str
+    bank_version: str
+    block_size: int
+    key: HistoryKey
+
+    @classmethod
+    def from_history(cls, history: SavedHistory) -> "HistoryDescriptor":
+        if history.key is None:
+            raise ValueError("worker descriptors require a native history key")
+        return cls(
+            history.entry_id, history.bank_version, history.block_size, history.key
+        )
+
+
+@dataclass(frozen=True)
 class HistoryLease:
     """One connector-owned hold, retained across native admission retries."""
 
