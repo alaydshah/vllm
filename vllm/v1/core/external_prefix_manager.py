@@ -82,6 +82,30 @@ def register_external_prefix_coverage(
         group.register_external_prefix(request.request_id, coverage)
 
 
+def withdraw_external_prefix_coverage(
+    manager: "KVCacheManager", request_id: str
+) -> None:
+    """Withdraw a failed admission's coverage without freeing native blocks.
+
+    A later lookup may find a native dense hit. Only pending registrations may
+    be withdrawn; admitted requests must follow the native free lifecycle.
+    """
+    pending = []
+    for group in manager.coordinator.single_type_managers:
+        if (
+            isinstance(group, ExternalPrefixFullAttentionManager)
+            and request_id in group.external_prefixes
+        ):
+            if (
+                request_id in group.req_to_blocks
+                or request_id in group.num_cached_block
+            ):
+                raise ValueError("cannot withdraw admitted external coverage")
+            pending.append(group)
+    for group in pending:
+        del group.external_prefixes[request_id]
+
+
 class ExternalPrefixFullAttentionManager(FullAttentionManager):
     """Use native blocks only for the suffix of externally backed requests.
 
