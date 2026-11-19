@@ -1384,6 +1384,7 @@ class KVCacheTensor:
 
 class KVCacheGroupRole(str, Enum):
     DEFAULT = "default"
+    EXTERNAL_PREFIX = "external_prefix"
     HISPARSE_SOURCE = "hisparse_source"
     HISPARSE_INDEXER = "hisparse_indexer"
 

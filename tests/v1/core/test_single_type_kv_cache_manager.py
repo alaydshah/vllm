@@ -8,7 +8,11 @@ import torch
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.external_prefix import ExternalPrefixCoverage
-from vllm.v1.core.external_prefix_manager import ExternalPrefixFullAttentionManager
+from vllm.v1.core.external_prefix_manager import (
+    ExternalPrefixFullAttentionManager,
+    configure_external_prefix_groups,
+    register_external_prefix_coverage,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
@@ -32,6 +36,117 @@ from vllm.v1.kv_cache_interface import (
 )
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("enable_caching", [False, True])
+@pytest.mark.parametrize("block_sizes", [(16,), (16, 32)])
+def test_external_prefix_through_native_coordinator(enable_caching, block_sizes):
+    """Real admission and later decode use absolute counts and native release."""
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupRole,
+        KVCacheGroupSpec,
+    )
+    from vllm.v1.request import Request
+
+    config = KVCacheConfig(
+        num_blocks=20,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [f"layer{i}"],
+                FullAttentionSpec(
+                    size, num_kv_heads=1, head_size=1, dtype=torch.float32
+                ),
+            )
+            for i, size in enumerate(block_sizes)
+        ],
+    )
+    opted_in = configure_external_prefix_groups(config)
+    assert all(g.role == KVCacheGroupRole.DEFAULT for g in config.kv_cache_groups)
+    kwargs = dict(
+        max_model_len=256,
+        scheduler_block_size=max(block_sizes),
+        hash_block_size=16,
+        enable_caching=enable_caching,
+    )
+    stock = KVCacheManager(config, **kwargs)
+    assert all(
+        type(g) is FullAttentionManager for g in stock.coordinator.single_type_managers
+    )
+    manager = KVCacheManager(opted_in, **kwargs)
+    request = Request("A", list(range(81)), SamplingParams(), None)
+    register_external_prefix_coverage(manager, request, 64)
+    free = manager.block_pool.get_num_free_blocks()
+    allocated = manager.allocate_slots(request, 17, num_external_computed_tokens=64)
+    assert allocated is not None
+    assert [len(g) for g in allocated.blocks] == [
+        (17 + s - 1) // s for s in block_sizes
+    ]
+    assert manager.block_pool.get_num_free_blocks() == free - sum(
+        map(len, allocated.blocks)
+    )
+
+    # Mirror scheduler progress: no new cache hit on a running request.
+    request.num_computed_tokens = 81
+    request.append_output_token_ids(list(range(16)))
+    grown = manager.allocate_slots(request, 16)
+    assert grown is not None
+    assert [len(g) for g in grown.blocks] == [1] * len(block_sizes)
+    assert all(b.block_hash is None for g in manager.get_blocks("A").blocks for b in g)
+    blocks = manager.pop_blocks_for_free(request)
+    assert all(b.ref_cnt == 1 for b in blocks)
+    manager.block_pool.free_blocks(reversed(blocks))
+    assert manager.block_pool.get_num_free_blocks() == free
+    request.num_computed_tokens = 0
+    register_external_prefix_coverage(manager, request, 64)
+    manager.free(request)
+    assert all(
+        not g.external_prefixes for g in manager.coordinator.single_type_managers
+    )
+
+
+def test_external_prefix_registration_is_atomic_across_groups():
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.request import Request
+
+    config = KVCacheConfig(
+        3,
+        [],
+        [
+            KVCacheGroupSpec(
+                [f"layer{s}"],
+                FullAttentionSpec(s, num_kv_heads=1, head_size=1, dtype=torch.float32),
+            )
+            for s in (16, 32)
+        ],
+    )
+    manager = KVCacheManager(
+        configure_external_prefix_groups(config),
+        max_model_len=256,
+        scheduler_block_size=32,
+        hash_block_size=16,
+    )
+    request = Request("A", list(range(81)), SamplingParams(), None)
+    with pytest.raises(ValueError, match="complete blocks"):
+        register_external_prefix_coverage(manager, request, 16)
+    assert all(
+        not g.external_prefixes for g in manager.coordinator.single_type_managers
+    )
+    register_external_prefix_coverage(manager, request, 64)
+    # Only two usable blocks: the three-page suffix cannot be admitted.
+    free = manager.block_pool.get_num_free_blocks()
+    assert manager.allocate_slots(request, 17, num_external_computed_tokens=64) is None
+    assert manager.block_pool.get_num_free_blocks() == free
+    assert all(not g.req_to_blocks for g in manager.coordinator.single_type_managers)
+    manager.free(request)
+    assert all(
+        not g.external_prefixes for g in manager.coordinator.single_type_managers
+    )
 
 
 @pytest.fixture
