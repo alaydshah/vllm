@@ -5,6 +5,32 @@ from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
+class HistoryKey:
+    """An engine-scoped native chained hash at a complete prefix boundary.
+
+    The connector supplies a namespace tied to the model, execution/codec
+    configuration and hash seed. Use native request hashes, including their
+    salt, adapter and multimodal extra keys; never hash token IDs separately.
+    This identifies approximate saved history, not an exact native cache hit.
+    """
+
+    namespace: str
+    hash_block_size: int
+    prefix_tokens: int
+    prefix_hash: bytes
+
+    def __post_init__(self) -> None:
+        if (
+            not self.namespace
+            or not self.prefix_hash
+            or self.hash_block_size <= 0
+            or self.prefix_tokens <= 0
+            or self.prefix_tokens % self.hash_block_size
+        ):
+            raise ValueError("history key requires a namespace and aligned native hash")
+
+
+@dataclass(frozen=True)
 class SavedHistory:
     """Ready, immutable history owned by the store until explicit eviction.
 
@@ -21,6 +47,7 @@ class SavedHistory:
     bank_version: str
     resident_bytes: int
     payload: object = field(repr=False, compare=False)
+    key: HistoryKey | None = None
 
     def __post_init__(self) -> None:
         if not self.entry_id or not self.bank_version:
@@ -33,6 +60,8 @@ class SavedHistory:
             raise ValueError("history must cover complete positive pages")
         if self.resident_bytes <= 0:
             raise ValueError("resident_bytes must be positive")
+        if self.key is not None and self.key.prefix_tokens != self.prefix_tokens:
+            raise ValueError("history key must cover the saved prefix")
 
 
 @dataclass(frozen=True)

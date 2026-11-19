@@ -10,7 +10,9 @@ Attention scratch, compression scratch and native source blocks need separate
 budgets. They are not charged as saved resident payloads here.
 """
 
-from vllm.agentic_kv.history import HistoryLease, SavedHistory
+from collections.abc import Sequence
+
+from vllm.agentic_kv.history import HistoryKey, HistoryLease, SavedHistory
 
 
 class HistoryStore:
@@ -26,6 +28,7 @@ class HistoryStore:
         self._retired: dict[str, SavedHistory] = {}
         self._leases: dict[str, HistoryLease] = {}
         self._readers: dict[str, int] = {}
+        self._index: dict[HistoryKey, str] = {}
 
     def reserve(self, job_id: str, num_bytes: int) -> bool:
         """Reserve candidate capacity without changing native request admission."""
@@ -59,7 +62,54 @@ class HistoryStore:
         self._entries[history.entry_id] = history
         self._readers[history.entry_id] = 0
         self.resident_bytes += history.resident_bytes
+        if history.key is not None:
+            self._index[history.key] = history.entry_id
         self.abort(job_id)
+
+    def acquire_matching(
+        self,
+        request_id: str,
+        namespace: str,
+        block_hashes: Sequence[bytes],
+        hash_block_size: int,
+        num_prompt_tokens: int,
+    ) -> HistoryLease | None:
+        """Lease the longest ready prefix, leaving a prompt token to compute.
+
+        Only precomputed native hashes are inspected; this does no device work,
+        hashing or readiness waits. A retry retains its original generation,
+        even if a longer or newer history has since been published. The caller
+        handles local-cache preference and unsupported execution modes first.
+        """
+        if not request_id or not namespace or hash_block_size <= 0:
+            raise ValueError("matching requires identities and a positive hash size")
+        if num_prompt_tokens <= 0:
+            raise ValueError("matching requires a positive prompt length")
+        limit = min(len(block_hashes), (num_prompt_tokens - 1) // hash_block_size)
+        existing = self._leases.get(request_id)
+        if existing is not None:
+            key = existing.history.key
+            if (
+                key is None
+                or key.namespace != namespace
+                or key.hash_block_size != hash_block_size
+                or key.prefix_tokens // hash_block_size > limit
+                or block_hashes[key.prefix_tokens // hash_block_size - 1]
+                != key.prefix_hash
+            ):
+                raise ValueError("retry changed the leased history identity")
+            return existing
+        for count in range(limit, 0, -1):
+            key = HistoryKey(
+                namespace,
+                hash_block_size,
+                count * hash_block_size,
+                block_hashes[count - 1],
+            )
+            entry_id = self._index.get(key)
+            if entry_id is not None:
+                return self.acquire(request_id, entry_id)
+        return None
 
     def acquire(self, request_id: str, entry_id: str) -> HistoryLease | None:
         """Acquire once per request; identical retries retain the original hold."""
@@ -93,6 +143,9 @@ class HistoryStore:
         if entry_id not in self._entries or self._readers[entry_id]:
             return None
         history = self._entries.pop(entry_id)
+        if history.key is not None and self._index.get(history.key) == entry_id:
+            # Conservatively miss rather than resurrect an older generation.
+            del self._index[history.key]
         del self._readers[entry_id]
         self._retired[entry_id] = history
         return history

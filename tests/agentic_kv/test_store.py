@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
+
 import pytest
 
-from vllm.agentic_kv.history import SavedHistory
+from vllm.agentic_kv.history import HistoryKey, SavedHistory
 from vllm.agentic_kv.store import HistoryStore
 
 
@@ -97,3 +99,72 @@ def test_eviction_does_not_return_capacity_before_disposal():
     assert not store.reserve("next", 100)
     store.confirm_disposed(history)
     assert store.reserve("next", 100)
+
+
+def publish_keyed(store, name, tokens=64, prefix_hash=b"h8"):
+    key = HistoryKey("engine1", 8, tokens, prefix_hash)
+    history = replace(entry(name), prefix_tokens=tokens, key=key)
+    assert store.reserve(name, 100)
+    store.publish(name, history)
+    return history
+
+
+HASHES = [f"h{i}".encode() for i in range(1, 9)]
+
+
+def test_matching_uses_longest_ready_prefix_and_keeps_prompt_token():
+    store = HistoryStore(300, 3)
+    publish_keyed(store, "short", 32, b"h4")
+    publish_keyed(store, "long")
+    store.reserve("pending", 100)
+    # Native hash size (8) need not equal the saved page size (16).
+    lease = store.acquire_matching("A", "engine1", HASHES, 8, 65)
+    assert lease is not None and lease.history.entry_id == "long"
+    lease = store.acquire_matching("B", "engine1", HASHES, 8, 64)
+    assert lease is not None and lease.history.entry_id == "short"
+    assert store.acquire_matching("C", "engine1", HASHES, 8, 32) is None
+
+
+def test_matching_rejects_different_namespace_hash_or_hash_size():
+    store = HistoryStore(100, 1)
+    publish_keyed(store, "saved")
+    assert store.acquire_matching("A", "engine2", HASHES, 8, 65) is None
+    assert store.acquire_matching("A", "engine1", HASHES, 16, 65) is None
+    changed = [*HASHES[:-1], b"different-salt-or-prefix"]
+    assert store.acquire_matching("A", "engine1", changed, 8, 65) is None
+    assert store.acquire_matching("A", "engine1", [], 8, 65) is None
+    assert store.acquire_matching("A", "engine1", HASHES, 8, 65) is not None
+    with pytest.raises(ValueError, match="identity"):
+        store.acquire_matching("A", "engine1", changed, 8, 65)
+
+
+def test_publication_during_retry_preserves_leased_generation():
+    store = HistoryStore(300, 3)
+    publish_keyed(store, "old", 32, b"h4")
+    lease = store.acquire_matching("A", "engine1", HASHES, 8, 65)
+    assert lease is not None
+    publish_keyed(store, "replacement", 32, b"h4")
+    publish_keyed(store, "longer")
+    assert store.acquire_matching("A", "engine1", HASHES, 8, 65) is lease
+    newer = store.acquire_matching("B", "engine1", HASHES, 8, 65)
+    assert newer is not None and newer.history.entry_id == "longer"
+    store.release(lease)
+    assert store.evict("old") is lease.history
+    replacement = store.acquire_matching("C", "engine1", HASHES, 8, 64)
+    assert replacement is not None
+    assert replacement.history.entry_id == "replacement"
+
+
+def test_eviction_removes_lookup_before_disposal_credit():
+    store = HistoryStore(100, 1)
+    history = publish_keyed(store, "saved")
+    assert store.evict("saved") is history
+    assert store.acquire_matching("A", "engine1", HASHES, 8, 65) is None
+    assert not store.reserve("next", 100)
+    store.confirm_disposed(history)
+    assert store.reserve("next", 100)
+
+
+def test_saved_identity_must_cover_same_prefix():
+    with pytest.raises(ValueError, match="saved prefix"):
+        replace(entry(), key=HistoryKey("engine1", 8, 32, b"h4"))
