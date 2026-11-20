@@ -12,6 +12,7 @@ from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
+    from vllm.agentic_kv.statistics.contracts import StatisticsHandle
     from vllm.v1.worker.gpu.attn_utils import FastPrefillBatchMetadata
     from vllm.v1.worker.gpu.block_table import BlockTables
 
@@ -117,6 +118,9 @@ class InputBatch:
 
     # [num_reqs] set only under PCP+DCP (see CommonAttentionMetadata).
     dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None
+
+    # CPU ownership snapshot; backend must revalidate before GPU submission.
+    statistics_owners: tuple["StatisticsHandle | None", ...] | None = None
 
     @classmethod
     def make_dummy(

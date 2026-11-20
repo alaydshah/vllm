@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -185,6 +186,9 @@ logger = init_logger(__name__)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
+    # Installed only by an explicitly enabled statistics backend.
+    statistics_sampler: Callable[[InputBatch], Sequence[bool]] | None = None
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -1496,6 +1500,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch,
             batch_desc,
         )
+        if self.statistics_sampler is not None:
+            from vllm.agentic_kv.statistics.worker import prepare_owners
+
+            input_batch.statistics_owners = prepare_owners(
+                self.req_states, input_batch, self.statistics_sampler(input_batch)
+            )
         return input_batch
 
     def prepare_attn(

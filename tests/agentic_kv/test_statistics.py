@@ -309,3 +309,105 @@ def test_forge_reduction_flags_bad_coverage_and_count_overflow():
     kernel = load_forge_reduction()
     accumulate_forge_statistics(meta, scores, summary, routes, buffers, 0, kernel)
     assert torch.all((pool.writable(handle).flags & 6) == 6)
+
+
+def test_native_slot_attachment_reorder_and_stale_batch(setup):
+    """Batch position, native slot and statistics slot are independent."""
+    from vllm.agentic_kv.statistics.worker import attach, discard, prepare_owners
+
+    pool, _, writer = setup
+    states = SimpleNamespace(
+        req_id_to_index={"A": 2, "B": 0, "C": 1},
+        max_num_reqs=3,
+        statistics_pool=None,
+        statistics_handles=None,
+    )
+    a = attach(states, pool, identity())
+    b = attach(states, pool, replace(identity(), request_id="B"))
+    assert attach(states, pool, replace(identity(), request_id="C")) is None
+    with pytest.raises(ValueError, match="already owns"):
+        attach(states, pool, identity())
+    batch = SimpleNamespace(
+        num_reqs=3,
+        req_ids=["B", "C", "A"],
+        idx_mapping_np=[0, 1, 2],
+        is_prefilling_np=[False] * 3,
+        num_scheduled_tokens=[1] * 3,
+        num_computed_tokens_np=[8] * 3,
+    )
+    assert prepare_owners(states, batch, [True] * 3) == (b, None, a)
+    assert prepare_owners(states, batch, [False, True, True]) == (None, None, a)
+    old_batch = prepare_owners(states, batch, [True] * 3)
+    discard(states, "A")
+    assert states.statistics_handles[2] is None
+    with pytest.raises(ValueError, match="transferred"):
+        pool.writable(old_batch[2])
+    assert pool.reap() == 0
+    writer.events[-1].complete = True
+    assert pool.reap() == 1
+    replacement = attach(states, pool, identity(1))
+    assert replacement.slot == a.slot and replacement.serial != a.serial
+    with pytest.raises(ValueError, match="transferred"):
+        pool.writable(a)
+    assert prepare_owners(states, batch, [True] * 3)[2] is replacement
+
+
+def test_worker_detach_clears_native_slot_and_preserves_consumer_hold(setup):
+    from vllm.agentic_kv.statistics.worker import attach, detach, discard
+
+    pool, _, _ = setup
+    states = SimpleNamespace(
+        req_id_to_index={"A": 0},
+        max_num_reqs=1,
+        statistics_pool=None,
+        statistics_handles=None,
+    )
+    handle = attach(states, pool, identity())
+    lease = detach(states, "A")
+    assert lease.handle is handle
+    assert states.statistics_handles == [None]
+    discard(states, "A")  # Native removal must not discard the save's lease.
+    assert pool.reap() == 0
+    reader = Stream()
+    pool.consume(lease, reader, lambda _: None)
+    assert pool.reap() == 0
+    reader.events[-1].complete = True
+    assert pool.reap() == 1
+
+
+def test_worker_routes_reject_stale_mapping_and_unsupported_observations(setup):
+    from vllm.agentic_kv.statistics.worker import attach, prepare_owners
+
+    pool, _, _ = setup
+    states = SimpleNamespace(
+        req_id_to_index={"A": 0},
+        max_num_reqs=1,
+        statistics_pool=None,
+        statistics_handles=None,
+    )
+    attach(states, pool, identity())
+    batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["A"],
+        idx_mapping_np=[1],
+        is_prefilling_np=[False],
+        num_scheduled_tokens=[1],
+        num_computed_tokens_np=[8],
+    )
+    with pytest.raises(ValueError, match="mask"):
+        prepare_owners(states, batch, [])
+    with pytest.raises(ValueError, match="stale native"):
+        prepare_owners(states, batch, [True])
+    batch.idx_mapping_np = [0]
+    batch.num_computed_tokens_np = [2]
+    with pytest.raises(ValueError, match="coverage"):
+        prepare_owners(states, batch, [True])
+    batch.num_computed_tokens_np = [8]
+    batch.is_prefilling_np = [True]
+    with pytest.raises(ValueError, match="single-query"):
+        prepare_owners(states, batch, [True])
+    assert prepare_owners(states, batch, [False]) == (None,)
+    batch.is_prefilling_np = [False]
+    batch.num_scheduled_tokens = [2]
+    with pytest.raises(ValueError, match="single-query"):
+        prepare_owners(states, batch, [True])

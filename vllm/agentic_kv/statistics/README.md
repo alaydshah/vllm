@@ -22,32 +22,42 @@ those; the consumer interprets them. Zero samples means absence of evidence.
 Native request progress supplies the unchanged sampling policy in the future
 worker adapter. Removing policy from the pool does not change that policy.
 
-## Proposed native attachment
+## Native v2 attachment and CPU batch metadata
 
-The following is integration pseudocode, not installed runner fields or hooks:
+`RequestState` owns an optional statistics pool reference and a lazily allocated
+handle list indexed by its existing native request slots. `worker.attach()` uses
+the native request-ID lookup, rejects duplicate attachment and returns `None` on
+pool exhaustion. No second request registry or admission decision is introduced.
+The backend supplies immutable provenance explicitly; attachment is not automatic.
 
-```python
-request_state.stats = pool.acquire(identity)  # None means no capacity
+`RequestState.remove_request()` discards any attached handle before freeing its
+slot. The v2 runner already uses this path for completion and preemption, so
+statistics follow that lifecycle. A temporarily unscheduled request keeps its
+native slot and handle. Preemption discards observations conservatively; a resumed
+request starts with no handle. This does not implement cross-preemption merging.
 
-# Native batch preparation chooses sampled owners and stages routing.
-# Revalidate at actual submission, including every graph replay.
-destination = pool.writable(request_state.stats)
-attention(..., stats=destination)
+A future save calls `worker.detach()` before removal to transfer ownership and
+clear the native slot. Subsequent native removal leaves that consumer lease alone.
+The pool still requires `reap()` at worker completion processing; automatic native
+completion polling and save callbacks are not installed in this milestone.
 
-# Native lifecycle: after final permitted writes have been submitted.
-lease = pool.detach(request_state.stats)
-request_state.stats = None
-save_operation.attach(lease)
-```
+The v2 runner has a disabled-by-default `statistics_sampler` callback. When
+installed by a compatible backend, its existing input preparation calls
+`worker.prepare_owners()` after final batch ordering and places a CPU handle tuple
+on `InputBatch.statistics_owners`. The callback supplies the per-owner mask; the
+adapter introduces no sampling policy. Only selected single-query decode rows
+are supported. Unselected rows and exhausted slots carry `None`.
 
-Handles and events stay worker-local, not in scheduler metadata. The native
-request state must prevent duplicate acquisition and clear its handle when
-ownership transfers. `acquire()` does not maintain a second request registry.
+This tuple is an ownership snapshot, **not GPU write permission**. The backend
+must call `forge.resolve_routes()` immediately before every actual submission or
+graph replay, then stage routes with correct in-flight buffer lifetimes. Detaching
+or recycling a handle invalidates old snapshots. The pool cannot revoke already
+borrowed GPU pointers or intercept arbitrary graph replays.
 
-Destinations are borrowed tensor views. Native metadata and graph staging must
-prevent old prepared work from writing after detachment. `writable()` rejects
-transferred/stale handles, but cannot revoke previously borrowed pointers.
-The pool does not intercept arbitrary `graph.replay()` calls.
+CPU attachment/routing contract tests cover reorder, exhaustion, duplicate
+attachment, stale handles, consumer holds and unsupported observations. These
+use lightweight native-state fixtures; full runner and GPU staging validation
+remain pending. No statistics backend, sampler or pool is activated by default.
 
 ## Save and cancellation
 
@@ -79,7 +89,7 @@ Destinations have shape `[layers, 4 fields, KV heads, covered_tokens]`; kernels
 must honor strides when coverage is shorter than capacity. Native KV page holds
 remain the connector's separate responsibility.
 
-Before activation: attach handles to native worker request state; stage masks
+Before activation: connect backend attachment and completion callbacks; stage masks
 and destinations through native batch metadata; enforce submission-time graph
 lifetimes; connect model failure/preemption/cancellation; port prefill/turn-global
 merging and connect the implemented stride-aware reduction; wire validity-gated codec publication;
@@ -112,5 +122,5 @@ The caller must resolve handles at each submission, stage routes without
 modifying in-flight metadata, and order writes on the pool's model stream.
 
 The adapter is tested with the actual research attention kernels; it does not
-install those kernels as a native vLLM attention backend. Native runner staging,
+install those kernels as a native vLLM attention backend. GPU route staging,
 model failure handling and real codec publication remain pending.

@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+
+if TYPE_CHECKING:
+    from vllm.agentic_kv.statistics.contracts import StatisticsHandle
+    from vllm.agentic_kv.statistics.pool import StatisticsPool
 
 
 class RequestState:
@@ -27,6 +33,8 @@ class RequestState:
         # Optional immutable storage offset, owned by the native request slot.
         # Allocate only when an external-prefix request is admitted.
         self.external_prefix_lengths: StagedWriteTensor | None = None
+        self.statistics_pool: StatisticsPool | None = None
+        self.statistics_handles: list[StatisticsHandle | None] | None = None
         self.req_id_to_index: dict[str, int] = {}
         self.index_to_req_id: dict[int, str] = {}
         self.free_indices = list(range(max_num_reqs))
@@ -143,9 +151,14 @@ class RequestState:
 
     def remove_request(self, req_id: str) -> int | None:
         """Return the freed slot index, or None if the request was not found."""
-        req_idx = self.req_id_to_index.pop(req_id, None)
+        req_idx = self.req_id_to_index.get(req_id)
         if req_idx is None:
             return None
+        if self.statistics_handles is not None:
+            from vllm.agentic_kv.statistics.worker import discard
+
+            discard(self, req_id)
+        self.req_id_to_index.pop(req_id)
         self.index_to_req_id.pop(req_idx, None)
         self.free_indices.append(req_idx)
         return req_idx
