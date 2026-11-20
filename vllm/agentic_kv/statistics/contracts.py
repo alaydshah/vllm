@@ -47,7 +47,7 @@ class StatisticsHandle:
 
 @dataclass(frozen=True)
 class StatisticsDestination:
-    """Borrowed views, valid only inside the guarded producer/consumer callback.
+    """Borrowed views governed by native submission and detached lease lifetimes.
 
     sums: FP32 [layers, four fields, KV heads, covered positions].
     counts/flags: int32 [layers, KV heads]. Producer reduces directly into sums,
@@ -62,7 +62,11 @@ class StatisticsDestination:
 
 
 @dataclass(frozen=True)
-class StatisticsSnapshot:
+class StatisticsLease:
+    """Detached storage ownership; observation provenance belongs to the save.
+
+    This is not permission to publish. The consumer validates GPU counts/flags
+    and native model success. Zero counts remain absence of evidence.
+    """
+
     handle: StatisticsHandle
-    last_ordinal: int
-    sample_count: int
