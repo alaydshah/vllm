@@ -82,5 +82,35 @@ remain the connector's separate responsibility.
 Before activation: attach handles to native worker request state; stage masks
 and destinations through native batch metadata; enforce submission-time graph
 lifetimes; connect model failure/preemption/cancellation; port prefill/turn-global
-merging and the stride-aware reduction; wire validity-gated codec publication;
+merging and connect the implemented stride-aware reduction; wire validity-gated codec publication;
 reserve startup HBM and measure end-to-end quality and overhead.
+
+## Forge statistics producer adapter
+
+`forge.resolve_routes(pool, owners)` resolves sampled handles in native batch
+order into CPU `(slot, covered_tokens)` pairs. Unsampled owners are represented
+by `None` and become slot `-1`. Sampling remains a caller decision. Duplicate
+write destinations and stale/detached handles are rejected. The caller stages
+these pairs into reusable int64 GPU metadata and uses the same selection to
+control Forge score/summary exports.
+
+`forge.accumulate_forge_statistics(...)` consumes the real Forge split/combine
+outputs and reduces directly into one layer of the pool with tensor strides.
+It preserves the four statistics and six-query-head mean, increments counts once
+per sampled layer/head, and ORs sticky GPU flags (1: invalid/overflowed values,
+2: inconsistent coverage, 4: count overflow). Inputs are log2 score lanes
+`0,1,2,4,5,6` and combine metadata containing normalization and energy partials.
+This adapter deliberately supports the source kernel's four-KV-head geometry;
+it is not a general attention-observation ABI.
+
+The reduction has no explicit tensor allocation, host result read or metadata
+transfer. Call `load_forge_reduction()` explicitly at startup, then warm the kernel before
+timed/captured execution. This milestone uses an opt-in source build requiring a
+working ROCm/CUDA toolchain; native backend build packaging remains pending.
+An all-unsampled batch should use plain attention and skip reduction entirely.
+The caller must resolve handles at each submission, stage routes without
+modifying in-flight metadata, and order writes on the pool's model stream.
+
+The adapter is tested with the actual research attention kernels; it does not
+install those kernels as a native vLLM attention backend. Native runner staging,
+model failure handling and real codec publication remain pending.

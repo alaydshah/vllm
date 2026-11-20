@@ -215,3 +215,97 @@ def test_cuda_graph_adapter_must_resolve_handle_at_submission():
     pool.consume(lease, writer, lambda _: None)
     writer.synchronize()
     assert pool.reap() == 1
+
+
+def test_forge_routes_follow_native_order_and_reject_stale_or_duplicate_handles():
+    from vllm.agentic_kv.statistics.forge import resolve_routes
+
+    buffers = StatisticsBuffers(StatisticsCapacity(2, 2, 4, 8), torch.device("cpu"))
+    pool = StatisticsPool(buffers, Stream(), Event)
+    a, b = pool.acquire(identity()), pool.acquire(identity(1, 7))
+    assert resolve_routes(pool, [b, None, a]) == ((b.slot, 7), (-1, 0), (a.slot, 3))
+    with pytest.raises(ValueError, match="duplicate"):
+        resolve_routes(pool, [a, a])
+    pool.detach(a)
+    with pytest.raises(ValueError, match="transferred"):
+        resolve_routes(pool, [a])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
+def test_forge_reduction_routes_coverage_and_flags_across_graph_replay():
+    from vllm.agentic_kv.statistics.forge import (
+        accumulate_forge_statistics,
+        load_forge_reduction,
+        resolve_routes,
+    )
+
+    device = torch.device("cuda")
+    writer = torch.cuda.current_stream()
+    buffers = StatisticsBuffers(StatisticsCapacity(2, 2, 4, 37), device)
+    buffers.sums.fill_(-123)
+    pool = StatisticsPool(buffers, writer)
+    a, b = pool.acquire(identity(0, 17)), pool.acquire(identity(1, 9))
+    meta = torch.zeros((8, 10), dtype=torch.int64, device=device)
+    meta[:, 1] = 32
+    scores = torch.zeros((8, 32, 8), device=device)
+    scores[:, :, 3] = scores[:, :, 7] = float("nan")
+    summary = torch.zeros((48, 18), device=device)
+    summary[:, 1], summary[:, 2], summary[:, 3] = 1 / 32, 0.5, 2.0
+    routes = torch.tensor(resolve_routes(pool, [b, None]), device=device)
+
+    kernel = load_forge_reduction()
+
+    def reduce():
+        accumulate_forge_statistics(meta, scores, summary, routes, buffers, 1, kernel)
+
+    reduce()
+    writer.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        reduce()
+    graph.replay()  # B's second observation.
+    routes.copy_(torch.tensor(resolve_routes(pool, [None, a]), device=device))
+    graph.replay()  # Same graph now writes A, not B.
+    expected = torch.tensor([1 / 32, 1 / 1024, 0.5 / 1024, 1 / 1024], device=device)
+    for handle, count, length in ((a, 1, 17), (b, 2, 9)):
+        destination = pool.writable(handle)
+        torch.testing.assert_close(
+            destination.sums[1],
+            (expected[:, None, None] * count).expand(4, 4, length),
+        )
+        assert torch.all(destination.counts[1] == count)
+        assert torch.all(destination.counts[0] == 0)
+        assert torch.all(destination.flags == 0)
+        assert torch.all(buffers.sums[handle.slot, :, :, :, length:] == -123)
+
+    scores[4, 0, 0] = float("nan")
+    graph.replay()
+    assert pool.writable(a).flags[1, 0] & 1
+    scores[4, 0, 0] = 0
+    graph.replay()
+    assert pool.writable(a).flags[1, 0] & 1
+    assert torch.all(pool.writable(b).flags == 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
+def test_forge_reduction_flags_bad_coverage_and_count_overflow():
+    from vllm.agentic_kv.statistics.forge import (
+        accumulate_forge_statistics,
+        load_forge_reduction,
+        resolve_routes,
+    )
+
+    device = torch.device("cuda")
+    buffers = StatisticsBuffers(StatisticsCapacity(1, 1, 4, 16), device)
+    pool = StatisticsPool(buffers, torch.cuda.current_stream())
+    handle = pool.acquire(identity(0, 16))
+    pool.writable(handle).counts.fill_(2**31 - 1)
+    meta = torch.zeros((4, 10), dtype=torch.int64, device=device)
+    meta[:, 1] = 8
+    scores = torch.zeros((4, 16, 8), device=device)
+    summary = torch.zeros((24, 18), device=device)
+    summary[:, 1] = 1 / 8
+    routes = torch.tensor(resolve_routes(pool, [handle]), device=device)
+    kernel = load_forge_reduction()
+    accumulate_forge_statistics(meta, scores, summary, routes, buffers, 0, kernel)
+    assert torch.all((pool.writable(handle).flags & 6) == 6)
