@@ -124,3 +124,38 @@ modifying in-flight metadata, and order writes on the pool's model stream.
 The adapter is tested with the actual research attention kernels; it does not
 install those kernels as a native vLLM attention backend. GPU route staging,
 model failure handling and real codec publication remain pending.
+
+## Fixed-address GPU route staging
+
+`routes.StatisticsRoutes` reserves one int64 GPU table `[max_num_reqs, 2]`
+and a bounded number of pinned CPU tables at startup. Configure the CPU copy
+capacity from the native maximum concurrent batches. Tensor costs are
+`16 * max_num_reqs` GPU bytes and that amount times the copy capacity on the host;
+allocator/event overhead is additional. No tensor grows during submission.
+
+The v2 runner's opt-in `statistics_routes` stages the current owner snapshot
+before eager execution or FULL/PIECEWISE replay. Staging revalidates live handles
+and duplicate destinations, fills unused/padded rows with disabled slots, and
+copies once per batch. All layers share the fixed GPU pointer. Dummy and
+all-unsampled batches explicitly disable previous routes.
+
+Copies and every reader must use the pool's one model stream. Consequently the
+next GPU copy is ordered after the previous model's readers, even while CPU
+preparation overlaps GPU execution. Each pinned CPU table has a copy-completion
+event: CPU mutation is forbidden until that copy completes. Queries are
+nonblocking; if no table is reusable, staging disables this batch's optional
+observations. It does not wait, grow storage or change request admission. This
+capacity fallback must gate both score exports and reduction through the same
+GPU routes; zero counts remain absence of evidence. Invalid handles raise rather
+than being treated as an ordinary capacity miss.
+
+Graphs capture route readers, never `stage()`. Every replay must pass through the
+runner's staging hook. Capture starts with disabled routes; backend registration
+must bind that same fixed pointer to its capture metadata. A copy/event failure
+quarantines its CPU table. Microbatch overlap, context parallelism and speculative
+execution are rejected when routing is enabled; their stream/layout contracts
+have not been implemented. Direct calls bypassing the runner are unsupported.
+
+The constructor and runner hook remain opt-in, not automatically activated.
+Backend capture binding, startup budget enforcement, producer export masking,
+completion polling and valid-save publication still gate real model serving.

@@ -199,7 +199,7 @@ def test_cuda_graph_adapter_must_resolve_handle_at_submission():
         handle = pool.acquire(identity())
         destination = pool.writable(handle)
         writer.synchronize()
-        with torch.cuda.graph(graph, stream=writer):
+        with torch.cuda.graph(graph):
             add_sample(destination)
 
         def native_adapter_submit():
@@ -236,8 +236,8 @@ def test_forge_reduction_routes_coverage_and_flags_across_graph_replay():
     from vllm.agentic_kv.statistics.forge import (
         accumulate_forge_statistics,
         load_forge_reduction,
-        resolve_routes,
     )
+    from vllm.agentic_kv.statistics.routes import StatisticsRoutes
 
     device = torch.device("cuda")
     writer = torch.cuda.current_stream()
@@ -251,7 +251,9 @@ def test_forge_reduction_routes_coverage_and_flags_across_graph_replay():
     scores[:, :, 3] = scores[:, :, 7] = float("nan")
     summary = torch.zeros((48, 18), device=device)
     summary[:, 1], summary[:, 2], summary[:, 3] = 1 / 32, 0.5, 2.0
-    routes = torch.tensor(resolve_routes(pool, [b, None]), device=device)
+    staging = StatisticsRoutes(pool, 2, 2)
+    assert staging.stage([b, None])
+    routes = staging.gpu
 
     kernel = load_forge_reduction()
 
@@ -263,8 +265,9 @@ def test_forge_reduction_routes_coverage_and_flags_across_graph_replay():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         reduce()
+    assert staging.stage([b, None])
     graph.replay()  # B's second observation.
-    routes.copy_(torch.tensor(resolve_routes(pool, [None, a]), device=device))
+    assert staging.stage([None, a])
     graph.replay()  # Same graph now writes A, not B.
     expected = torch.tensor([1 / 32, 1 / 1024, 0.5 / 1024, 1 / 1024], device=device)
     for handle, count, length in ((a, 1, 17), (b, 2, 9)):
@@ -279,9 +282,11 @@ def test_forge_reduction_routes_coverage_and_flags_across_graph_replay():
         assert torch.all(buffers.sums[handle.slot, :, :, :, length:] == -123)
 
     scores[4, 0, 0] = float("nan")
+    assert staging.stage([None, a])
     graph.replay()
     assert pool.writable(a).flags[1, 0] & 1
     scores[4, 0, 0] = 0
+    assert staging.stage([None, a])
     graph.replay()
     assert pool.writable(a).flags[1, 0] & 1
     assert torch.all(pool.writable(b).flags == 0)
@@ -411,3 +416,169 @@ def test_worker_routes_reject_stale_mapping_and_unsupported_observations(setup):
     batch.num_scheduled_tokens = [2]
     with pytest.raises(ValueError, match="single-query"):
         prepare_owners(states, batch, [True])
+
+
+def test_route_staging_declines_busy_copy_without_reusing_host_storage():
+    from vllm.agentic_kv.statistics.routes import StatisticsRoutes
+
+    buffers = StatisticsBuffers(StatisticsCapacity(2, 1, 4, 8), torch.device("cpu"))
+    writer = Stream()
+    pool = StatisticsPool(buffers, writer, Event)
+    a, b = pool.acquire(identity()), pool.acquire(identity(1))
+    routes = StatisticsRoutes(pool, 3, 2, Event)
+    pointer = routes.gpu.data_ptr()
+    assert routes.device_bytes == 48 and routes.host_bytes == 96
+    assert routes.stage([a, None, b])
+    first = routes.gpu.clone()
+    assert routes.stage([b, a])
+    second = routes.gpu.clone()
+    assert not routes.stage([a])  # Both copy-completion events still pending.
+    assert torch.all(routes.gpu == -1)
+    assert torch.equal(first, torch.tensor([[a.slot, 3], [-1, 0], [b.slot, 3]]))
+    assert torch.equal(second, torch.tensor([[b.slot, 3], [a.slot, 3], [-1, -1]]))
+    writer.events[0].complete = True
+    assert routes.stage([None, b])
+    assert routes.gpu.data_ptr() == pointer
+    assert not routes.stage([])  # A dummy/unsampled replay clears old routes.
+    assert torch.all(routes.gpu == -1)
+
+
+def test_route_submission_rejects_detached_duplicate_and_oversized_owners():
+    from vllm.agentic_kv.statistics.routes import StatisticsRoutes
+
+    buffers = StatisticsBuffers(StatisticsCapacity(1, 1, 4, 8), torch.device("cpu"))
+    pool = StatisticsPool(buffers, Stream(), Event)
+    a = pool.acquire(identity())
+    routes = StatisticsRoutes(pool, 2, 1, Event)
+    with pytest.raises(ValueError, match="duplicate"):
+        routes.stage([a, a])
+    with pytest.raises(ValueError, match="capacity"):
+        routes.stage([None] * 3)
+    pool.detach(a)
+    with pytest.raises(ValueError, match="transferred"):
+        routes.stage([a])
+    assert torch.all(routes.gpu == -1)
+
+
+def test_failed_route_event_record_quarantines_host_buffer():
+    from vllm.agentic_kv.statistics.routes import StatisticsRoutes
+
+    class FailedEvent(Event):
+        def record(self, stream):
+            raise RuntimeError("event recording failed")
+
+    pool = StatisticsPool(
+        StatisticsBuffers(StatisticsCapacity(1, 1, 4, 8), torch.device("cpu")),
+        Stream(),
+        Event,
+    )
+    a = pool.acquire(identity())
+    routes = StatisticsRoutes(pool, 1, 1, FailedEvent)
+    with pytest.raises(RuntimeError, match="event recording"):
+        routes.stage([a])
+    assert not routes.stage([a])
+    assert torch.all(routes.gpu == -1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
+def test_gpu_routes_preserve_queued_graph_readers_and_reject_stale_replay():
+    from vllm.agentic_kv.statistics.routes import StatisticsRoutes
+
+    class HeldEvent:
+        """Delay CPU slot reclamation deterministically, without blocking the GPU."""
+
+        def __init__(self):
+            self.event = torch.cuda.Event()
+            self.release = False
+
+        def record(self, stream):
+            self.event.record(stream)
+
+        def query(self):
+            return self.release and self.event.query()
+
+    device = torch.device("cuda")
+    writer = torch.cuda.current_stream()
+    pool = StatisticsPool(
+        StatisticsBuffers(StatisticsCapacity(2, 1, 4, 8), device), writer
+    )
+    a, b = pool.acquire(identity()), pool.acquire(identity(1))
+    events = []
+
+    def event_factory():
+        event = HeldEvent()
+        events.append(event)
+        return event
+
+    routes = StatisticsRoutes(pool, 3, 2, event_factory)
+    observed = torch.empty_like(routes.gpu)
+    results = [torch.empty_like(observed) for _ in range(4)]
+    # Capture only the reader. Every real replay revalidates/stages outside capture.
+    observed.copy_(routes.gpu)
+    writer.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        observed.copy_(routes.gpu)
+    assert routes.stage([a, None, b])
+    graph.replay()
+    results[0].copy_(observed)
+    assert routes.stage([b, a])
+    graph.replay()
+    results[1].copy_(observed)
+    assert not routes.stage([a])  # Exhaustion disables; no host wait or overwrite.
+    graph.replay()
+    results[2].copy_(observed)
+    pool.discard(a)
+    with pytest.raises(ValueError, match="transferred"):
+        routes.stage([a])
+    with (
+        torch.cuda.stream(torch.cuda.Stream()),
+        pytest.raises(RuntimeError, match="bound model stream"),
+    ):
+        routes.stage([b])
+    writer.synchronize()
+    assert pool.reap() == 1
+    replacement = pool.acquire(identity(2))
+    assert replacement.slot == a.slot
+    for event in events:
+        event.release = True
+    assert routes.stage([replacement])
+    graph.replay()
+    results[3].copy_(observed)
+    expected = [
+        [[a.slot, 3], [-1, 0], [b.slot, 3]],
+        [[b.slot, 3], [a.slot, 3], [-1, -1]],
+        [[-1, -1]] * 3,
+        [[replacement.slot, 3], [-1, -1], [-1, -1]],
+    ]
+    for result, rows in zip(results, expected):
+        torch.testing.assert_close(result.cpu(), torch.tensor(rows))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
+def test_native_request_slot_reuse_does_not_inherit_statistics():
+    from vllm.agentic_kv.statistics.worker import attach
+    from vllm.v1.worker.gpu.states import RequestState
+
+    device = torch.device("cuda")
+    states = RequestState(2, 8, 8, 0, 16, device)
+    pool = StatisticsPool(
+        StatisticsBuffers(StatisticsCapacity(2, 1, 4, 8), device),
+        torch.cuda.current_stream(),
+    )
+    states.add_request("A", 3, [1, 2, 3], 3, 5)
+    handle = attach(states, pool, identity())
+    native_slot = states.req_id_to_index["A"]
+    assert states.remove_request("A") == native_slot
+    assert states.statistics_handles[native_slot] is None
+    with pytest.raises(ValueError, match="transferred"):
+        pool.writable(handle)
+    states.add_request("A", 3, [1, 2, 3], 3, 5)
+    assert states.req_id_to_index["A"] == native_slot
+    assert states.statistics_handles[native_slot] is None
+    replacement = attach(states, pool, identity(1))
+    assert replacement is not handle
+    assert states.remove_request("A") == native_slot
+    assert states.remove_request("A") is None
+    torch.cuda.current_stream().synchronize()
+    assert pool.reap() == 2

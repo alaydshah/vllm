@@ -23,7 +23,7 @@ import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from copy import deepcopy
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -182,12 +182,16 @@ from vllm.v1.worker.utils import (
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
+if TYPE_CHECKING:
+    from vllm.agentic_kv.statistics.routes import StatisticsRoutes
+
 logger = init_logger(__name__)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     # Installed only by an explicitly enabled statistics backend.
     statistics_sampler: Callable[[InputBatch], Sequence[bool]] | None = None
+    statistics_routes: "StatisticsRoutes | None" = None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -1940,6 +1944,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             request_ids=input_batch.req_ids,
             num_tokens=input_batch.num_tokens,
         )
+
+        if self.statistics_routes is not None:
+            if (
+                ubatch_state is not None
+                or self.pcp_manager is not None
+                or self.dcp_size != 1
+                or self.speculator is not None
+            ):
+                raise NotImplementedError(
+                    "Statistics routing requires single-stream, non-speculative "
+                    "execution without context parallelism"
+                )
+            self.statistics_routes.stage(input_batch.statistics_owners or ())
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
