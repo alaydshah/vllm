@@ -1422,6 +1422,7 @@ package_data = {
     "vllm": [
         "py.typed",
         "agentic_kv/statistics/*.cu",
+        "agentic_kv/attention/*.cu",
         "libs/*.so*",
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
