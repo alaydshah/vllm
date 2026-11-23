@@ -794,11 +794,10 @@ __device__ __forceinline__ void split_body(
 #define SPLIT_PASS                                                             \
   meta, jobs, rot, query, lut, partial, ml, scores, score_stride, tile_tokens, \
       owner_ptrs, pages, routes
-// 6 waves/SIMD (<= 80 VGPRs; the LDS footprint already admits 6 workgroups per
-// CU).
+// Let the compiler balance occupancy against native-page addressing state.
+// Forcing six waves per SIMD spills values used by both token paths.
 template <bool SAMPLE>
-__global__ void __launch_bounds__(256)
-    __attribute__((amdgpu_waves_per_eu(6, 6))) split_kernel(SPLIT_ARGS) {
+__global__ void __launch_bounds__(256) split_kernel(SPLIT_ARGS) {
   split_body<SAMPLE>(SPLIT_PASS);
 }
 
