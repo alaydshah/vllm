@@ -459,7 +459,9 @@ __device__ __forceinline__ void token(const Owner& o, const Record& r,
     constexpr int fixed_page_size = PAGE_SIZE;
     const int page_size =
         fixed_page_size == 0 ? o.pages.block_size : fixed_page_size;
-    const int block = o.blocks[suffix_pos / page_size];
+    // Every lane reads the same block ID; the table is immutable during launch.
+    // Keep the lookup and dependent row arithmetic scalar.
+    const int block = (int)*constant_words(o.blocks + suffix_pos / page_size);
     const int offset = suffix_pos % page_size;
     const int64_t row = (int64_t)block * o.pages.block_stride +
                         offset * o.pages.token_stride +
