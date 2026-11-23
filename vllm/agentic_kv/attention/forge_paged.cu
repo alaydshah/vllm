@@ -366,6 +366,8 @@ __device__ __forceinline__ Record load_record_readonly(const Record* base,
 // first wait. Residual rows are clamped to row 0 for tokens without a residual
 // (always in-bounds: prepare appends a dummy row to each stream); only the
 // Hadamard / apply arithmetic stays behind the wave-uniform branches.
+// PAGE_SIZE == 0 keeps runtime sizing for other supported native page sizes.
+template <int PAGE_SIZE>
 __device__ __forceinline__ void token(const Owner& o, const Record& r,
                                       const f4* __restrict__ ktab,
                                       const f4* __restrict__ vtab, int pos,
@@ -454,8 +456,11 @@ __device__ __forceinline__ void token(const Owner& o, const Record& r,
     // Native suffix pages contain natural-order, post-RoPE BF16 K/V.
     // Only the compressed prefix uses Forge's packed physical K order.
     const int suffix_pos = pos - o.n;
-    const int block = o.blocks[suffix_pos / o.pages.block_size];
-    const int offset = suffix_pos % o.pages.block_size;
+    constexpr int fixed_page_size = PAGE_SIZE;
+    const int page_size =
+        fixed_page_size == 0 ? o.pages.block_size : fixed_page_size;
+    const int block = o.blocks[suffix_pos / page_size];
+    const int offset = suffix_pos % page_size;
     const int64_t row = (int64_t)block * o.pages.block_stride +
                         offset * o.pages.token_stride +
                         o.head * o.pages.head_stride;
@@ -569,14 +574,13 @@ __global__ void pack_kernel(Record* dst, const int32_t* pk, const int32_t* pv,
         Record{(uint16_t)pk[j], (uint16_t)pv[j], gk[j], gv[j], ks[j], vs[j]};
 }
 
-// One token per wave-iteration, one memory round trip each (80 VGPRs -> 6
-// waves/SIMD; the budget is held by lane-indexed structured row loads, the
-// pre-permuted K byte stream and the two-register FWHT xor-4 stage). Flat 64-B
+// One token per wave-iteration, with lane-indexed structured prefix row loads,
+// a pre-permuted K byte stream and a two-register FWHT xor-4 stage. Flat 64-B
 // job record (prepare-built, one s_load_dwordx16, no dependent meta chain):
 //   0 bh  1 split  2 begin  3 end  4 n  5 length  6 record_base  7 koff  8 voff
 //   9 kscale_base 10 bank_off (floats)  11 toff  12 prow  13..15 unused
 constexpr int JOB_STRIDE = 16;
-template <bool SAMPLE>
+template <bool SAMPLE, int PAGE_SIZE>
 __device__ __forceinline__ void split_body(
     const int64_t* __restrict__ meta, const int32_t* __restrict__ jobs,
     const float* __restrict__ rot, const BF16* __restrict__ query,
@@ -732,8 +736,9 @@ __device__ __forceinline__ void split_body(
       rn = load_record_readonly(
           o.records, pn);  // wave-uniform prefetch of the next record
     float k[4], v[4];
-    token(o, r, reinterpret_cast<const f4*>(ktab),
-          reinterpret_cast<const f4*>(vtab), pos, lane, offr, sg, k, v);
+    token<PAGE_SIZE>(o, r, reinterpret_cast<const f4*>(ktab),
+                     reinterpret_cast<const f4*>(vtab), pos, lane, offr, sg, k,
+                     v);
     r = rn;
     token_accumulate<SAMPLE>(k, v, qp, value, m_ref, denom, lane, store_lane,
                              sc_base, pos, scores, sample_owner);
@@ -796,9 +801,9 @@ __device__ __forceinline__ void split_body(
       owner_ptrs, pages, routes
 // Let the compiler balance occupancy against native-page addressing state.
 // Forcing six waves per SIMD spills values used by both token paths.
-template <bool SAMPLE>
+template <bool SAMPLE, int PAGE_SIZE>
 __global__ void __launch_bounds__(256) split_kernel(SPLIT_ARGS) {
-  split_body<SAMPLE>(SPLIT_PASS);
+  split_body<SAMPLE, PAGE_SIZE>(SPLIT_PASS);
 }
 
 constexpr int MAX_SPLITS =
@@ -971,19 +976,33 @@ void decode_split(torch::Tensor meta, torch::Tensor jobs, torch::Tensor rot,
                     key.stride(0),
                     key.stride(1),
                     key.stride(2)};
-#define LAUNCH(SAMPLE)                                                       \
+#define LAUNCH(SAMPLE, PAGE_SIZE)                                            \
   hipLaunchKernelGGL(                                                        \
-      (split_kernel<SAMPLE>), dim3(jobs.size(0)), dim3(256), 0, stream,      \
-      meta.data_ptr<int64_t>(), jobs.data_ptr<int32_t>(),                    \
+      (split_kernel<SAMPLE, PAGE_SIZE>), dim3(jobs.size(0)), dim3(256), 0,   \
+      stream, meta.data_ptr<int64_t>(), jobs.data_ptr<int32_t>(),            \
       rot.data_ptr<float>(), reinterpret_cast<const BF16*>(q.data_ptr()),    \
       reinterpret_cast<const float4*>(lut.data_ptr()),                       \
       reinterpret_cast<uint32_t*>(partial.data_ptr()), ml.data_ptr<float>(), \
       scores.data_ptr<float>(), scores.size(1), tile,                        \
       owner_ptrs.data_ptr<int64_t>(), pages, routes.data_ptr<int64_t>())
-  if (sample) {
-    LAUNCH(true);
+  if (pages.block_size == 16) {
+    if (sample) {
+      LAUNCH(true, 16);
+    } else {
+      LAUNCH(false, 16);
+    }
+  } else if (pages.block_size == 32) {
+    if (sample) {
+      LAUNCH(true, 32);
+    } else {
+      LAUNCH(false, 32);
+    }
   } else {
-    LAUNCH(false);
+    if (sample) {
+      LAUNCH(true, 0);
+    } else {
+      LAUNCH(false, 0);
+    }
   }
 #undef LAUNCH
   C10_CUDA_KERNEL_LAUNCH_CHECK();
